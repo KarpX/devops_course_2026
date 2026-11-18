@@ -1,0 +1,6 @@
+---
+app_image: "ghcr.io/karpx/devops-ci-app"
+app_tag: "37e9e52bfbc20cf52010e2741dd6e6042ae109b9"
+app_container_name: "devops-ci-app"
+app_host_port: 5000
+app_internal_port: 5000
