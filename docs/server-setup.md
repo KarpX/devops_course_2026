@@ -202,3 +202,79 @@ server {
 * Публикация портов: только 127.0.0.1:5000 (проксируется в Nginx), порт СУБД 5432 не публикуется на хосте.
 * Тома данных: именованный том db_data для каталога PostgreSQL /var/lib/postgresql/data.
 * Обратный прокси-сервер: Nginx перенаправляет запросы с /app/ на http://127.0.0.1:5000/ со сбросом префикса и пробросом заголовков Host, X-Real-IP, X-Forwarded-For, X-Forwarded-Proto.
+
+## 10. Ansible
+
+### 10.1. Общие сведения и архитектура
+* **Расположение проекта:** каталог `ansible/` в корне репозитория `devops_course_2026`.
+* **Управляющий узел (Control Node):** рабочая станция разработчика под управлением macOS (`ansible-core 2.21`, Python 3.15, коллекции `ansible.posix 1.6.2`, `community.docker 4.5.0`, `community.general 9.5.0`).
+* **Управляемый узел (Managed Node):** виртуальная машина VirtualBox (`devops-vm`), сетевой адаптер Host-only (`192.168.56.2`), порт SSH `22`, ОС Ubuntu Server 26.04+ LTS. Не требует установки постоянного агентского ПО — управление осуществляется модулями Ansible по SSH с выполнением через системный интерпретатор Python.
+
+### 10.2. Инвентарь и учетные записи
+* **Inventory bootstrap (`inventory/bootstrap.ini`):** используется исключительно для первичной настройки чистой виртуальной машины. Подключение выполняется от учетной записи `student` с интерактивным запросом паролей:
+  ```ini
+  [vm]
+  devops-vm ansible_host=192.168.56.2 ansible_port=22 ansible_user=student
+  ```
+* **Inventory prod (`inventory/prod.ini`):** используется по умолчанию (`ansible.cfg`) для всех регулярных запусков, развертывания обновлений и аудита. Подключение выполняется от сервисного пользователя `devops` строго по SSH-ключу:
+  ```ini
+  [vm]
+  devops-vm ansible_host=192.168.56.2 ansible_port=22 ansible_user=devops ansible_private_key_file=~/.ssh/devops_vm
+  ```
+* **Учетные записи:**
+  * `student` — пользователь начальной установки системы. После выполнения bootstrap парольная аутентификация по SSH отключается; доступ сохраняется через консоль VM и по публичным ключам.
+  * `devops` — выделенный пользователь автоматизации, создаваемый ролью `ssh`. Включен в группы `sudo` и `docker`. Настроен беспарольный sudo (`/etc/sudoers.d/devops`: `devops ALL=(ALL) NOPASSWD:ALL`, валидация через `visudo -cf`). Аутентификация осуществляется по ключу `~/.ssh/devops_vm.pub` (`mode: 0400/0700`).
+
+### 10.3. Роли Ansible и их зоны ответственности
+1. **`base`:**
+   * Проверка целевой ОС (Ubuntu 24.04+ / amd64 / arm64).
+   * Установка базовых системных пакетов и библиотек (`ca-certificates`, `curl`, `gnupg`, `openssh-server`, `ufw`, `python3-debian`, `python3-requests`, `qemu-user`, `qemu-user-binfmt`).
+   * Подключение официального репозитория Docker через `deb822_repository` с проверкой GPG-ключа.
+   * Установка пакетов Docker Engine (`docker-ce`, `docker-ce-cli`, `containerd.io`, `docker-buildx-plugin`, `docker-compose-plugin`) и запуск сервиса `docker`.
+2. **`ssh`:**
+   * Создание пользователя `devops` и каталога `~/.ssh`.
+   * Размещение открытого ключа `devops_vm.pub` в `authorized_keys`.
+   * Настройка файла `/etc/sudoers.d/devops` с валидацией через `visudo`.
+   * Ужесточение конфигурации SSH (`/etc/ssh/sshd_config.d/00-ansible-hardening.conf`): отключение паролей (`PasswordAuthentication no`), запрет входа root (`PermitRootLogin no`), ограничение пользователей (`AllowUsers student devops`), валидация через `sshd -t -f` и вызов обработчика `Restart SSH`.
+   * Настройка межсетевого экрана UFW: разрешение портов `22/tcp` и `80/tcp`, блокировка всех остальных входящих соединений (`default deny incoming`), разрешение исходящих (`default allow outgoing`).
+3. **`nginx`:**
+   * Установка веб-сервера Nginx.
+   * Развертывание обратного прокси-сервера из шаблона `devops-ci-app.conf.j2` в `/etc/nginx/sites-available/devops-ci-app`.
+   * Отключение дефолтной конфигурации (`/etc/nginx/sites-enabled/default`) и активация сайта приложения через символическую ссылку.
+   * Безопасное применение изменений: связка обработчиков `Validate Nginx before reload` (`nginx -t`) и `Reload Nginx` (`systemctl reload nginx`).
+4. **`app`:**
+   * Добавление пользователя `devops` в группу `docker`.
+   * Загрузка проверенного OCI-образа из реестра GHCR по полному SHA коммита.
+   * Запуск контейнера `devops-ci-app` с изоляцией порта `127.0.0.1:5000:5000` и политикой перезапуска `unless-stopped`.
+   * Контроль работоспособности приложения через периодический опрос эндпоинта `/health` модулем `uri` с проверкой HTTP 200 и тела `{"status":"ok"}`.
+
+### 10.4. Параметры приложения и контейнера
+* **Реестр и образ:** `ghcr.io/karpx/devops-ci-app`
+* **Фиксированный тег (полный SHA коммита из PR № 10):** `37e9e52bfbc20cf52010e2741dd6e6042ae109b9`
+* **Имя контейнера:** `devops-ci-app`
+* **Публикация портов:** `127.0.0.1:5000:5000` (порт 5000 привязан исключительно к loopback-интерфейсу хоста, прямой доступ из внешней сети исключен; входящий веб-трафик проходит через Nginx на порту 80).
+* **Эндпоинты проверки доступности:**
+  * Внутренний (прямой к приложению): `http://127.0.0.1:5000/health`
+  * Внешний (через обратный прокси Nginx): `http://192.168.56.2/health`
+  * Основной маршрут: `http://192.168.56.2/`
+
+### 10.5. Регламентные команды управления
+* **Проверка инвентаря и синтаксиса:**
+  ```bash
+  ansible-inventory --graph
+  ansible-playbook site.yml --syntax-check
+  ```
+* **Первичный запуск (Bootstrap чистой виртуальной машины):**
+  ```bash
+  ansible-playbook -i inventory/bootstrap.ini site.yml --ask-pass --ask-become-pass
+  ```
+* **Регулярный запуск и развертывание (Prod, по ключу):**
+  ```bash
+  ansible-playbook site.yml
+  ```
+  *(При отсутствии дрейфа конфигурации повторный запуск возвращает `changed=0, failed=0`).*
+* **Автоматический read-only аудит инфраструктуры:**
+  ```bash
+  ansible-playbook verify.yml
+  ```
+  *(Выполняет аудит фактических директив sshd, состояния контейнера Docker и ответа healthcheck без внесения изменений).*
