@@ -11,6 +11,8 @@
     tag: "{{ app_tag }}"
     source: pull
     state: present
+    pull:
+      platform: "{{ 'amd64' if ansible_architecture == 'aarch64' else omit }}"
 
 - name: Run application container
   community.docker.docker_container:
